@@ -6,13 +6,14 @@ module TimeProp
 println("Loading TimeProp module")
 println("Number of Julia threads: ", Threads.nthreads())
 using LinearAlgebra; println("LinearAlgebra loaded"); println("Number of BLAS threads: ", BLAS.get_num_threads())
-if Threads.nthreads()>1
+if Threads.nthreads()>=1
     println("Changing the number of BLAS threads to be the same as Julia threads!")
     BLAS.set_num_threads(Threads.nthreads())
 end
 using SparseArrays; println("SparseArrays loaded")
 using DifferentialEquations ; println("DifferentialEquations loaded")
 using PyCall; println("PyCall loaded")
+using Random; println("Random loaded")
 sp_sparse=pyimport("scipy.sparse") ; println("scipy.sparse loaded")
 try
     using MKLSparse; println("Using MKLSparse")
@@ -28,6 +29,10 @@ catch
     cuda_avail = false
 end
 include("./wfmod.jl"); using .wfmod
+
+using PyCall
+pushfirst!(PyVector(pyimport("sys")."path"), "")
+iofiles=pyimport("iofiles");
 
 function pysparse_to_julia(A)
     A = sp_sparse.csc_matrix(A)
@@ -126,7 +131,7 @@ function sesolve(H0,H0_td,fs_H0_td,psi0,ts,e_ops;dt=nothing,rtol=1e-10,atol=1e-1
 end
 
 
-function mcsolve(H0,H0_td,fs_H0_td,c_ops_no_td,c_ops_td,fs_c_ops_td,psi0,ts,e_ops;ntrajs = 1, dt=nothing,rtol=1e-10,atol=1e-10,verbose = false)
+function mcsolve(H0,H0_td,fs_H0_td,c_ops_no_td,c_ops_td,fs_c_ops_td,psi0,ts,e_ops;ntrajs = 1, dt=nothing,rtol=1e-10,atol=1e-10,verbose = false, seed_number = nothing , print_intermidiate = false, ntrajs_intermidiate = 10 , name_files_intermidiate = nothing)
     # MCWF solver for a single psi0. If you want to propagate an initial state that is
     # rho0 = \sum_i p_i psi_i * psi_i ^dag you just need to run this wavefunction and sum all results * p_i
     # H0 is the time independent Hamiltonian
@@ -138,16 +143,23 @@ function mcsolve(H0,H0_td,fs_H0_td,c_ops_no_td,c_ops_td,fs_c_ops_td,psi0,ts,e_op
     # ts is an array of times for the propagation
     # e_ops is a list of operators to perform expectation values
     println("-"^100); println("Starting a time-dependent MCWF Lindblad equation")
+    if seed_number!=nothing
+        println("Using a seed for random numbers, seed: ", seed_number)
+        
+        Random.seed!(seed_number)
+    end
     results = zeros(ComplexF64,length(ts),length(e_ops))
     results_all = results.*0.0
     temp = psi0 .* 0.0
     deltap = rand()
-    ps=[H0,H0_td,fs_H0_td,c_ops_no_td,c_ops_td,fs_c_ops_td,temp]
+
+    ps=(H0,H0_td,fs_H0_td,c_ops_no_td,c_ops_td,fs_c_ops_td,temp)
     if dt==nothing
         dt=ts[2]-ts[1]
     end
     
     function minus_im_Heff_mcsolve!(psires,psi,ps,t)
+        # ttt=time()
         H0,H0_td,fs_H0_td,c_ops_no_td,c_ops_td,fs_c_ops_td,temp = ps
         # Hamiltonian part
         mul!(psires,H0,psi,-1.0im,0.0)
@@ -163,16 +175,21 @@ function mcsolve(H0,H0_td,fs_H0_td,c_ops_no_td,c_ops_td,fs_c_ops_td,psi0,ts,e_op
         for i in 1:length(c_ops_td)
             mul!(temp,c_ops_td[i],psi,-1.0im*fs_c_ops_td[i](t),0.0)
             mul!(psires,c_ops_td[i]',temp,-0.5im * conj(fs_c_ops_td[i](t)),1.0)
-        end    
+        end
+        # println("Calling minus_im_Heff_mcsolve took: ", time()-ttt)
         return psires
     end
     
     function condition(u,t,integrator)
+        #ttt=time()
         #println(norm(u)^2, " ", deltap, " ",t)
-        norm(u)^2 -deltap
+        result = norm(u)^2 -deltap
+        #println("Calling condition took: ", time()-ttt)
+        return result
     end
 
     function affect!(integrator)
+        #ttt=time()
         #println(integrator.t , " ",deltap )
         #println(integrator.t , " ",deltap )
         n_cops = length(c_ops_td)+length(c_ops_no_td)
@@ -208,15 +225,19 @@ function mcsolve(H0,H0_td,fs_H0_td,c_ops_no_td,c_ops_td,fs_c_ops_td,psi0,ts,e_op
         if i_op>length(c_ops_td)
             wfmod.wf_collapse!(integrator.u , c_ops_no_td[i_op-length(c_ops_td)],temp)
         end
+
+        #println("Calling affect took: ", time()-ttt)
         deltap = rand()
     end    
     
     function get_callback(ts,results,e_ops,temp)
         function savefunc(u,t,integrator)
+            #ttt=time()
             it=findall(ts.≈t)[1]
             for i_eop in 1:length(e_ops)
                 results[it,i_eop] = wfmod.expectation_value_normalized(u,e_ops[i_eop],temp)
             end
+            #println("Calling savefunc took: ", time()-ttt)
             return nothing
         end
         FunctionCallingCallback(savefunc; funcat=ts)
@@ -237,6 +258,14 @@ function mcsolve(H0,H0_td,fs_H0_td,c_ops_no_td,c_ops_td,fs_c_ops_td,psi0,ts,e_op
         results.*=0.0
         if verbose
             println("Performing : ", itraj, " , out of ntrajs: ", ntrajs , "  Time for traj  : ", time()-t1, " time for setup : ",time()-t2)
+            flush(stdout)
+        end
+        if print_intermidiate
+            if itraj==1 || mod(itraj,ntrajs_intermidiate)==0
+                for i_eop in 1:length(e_ops)
+                    iofiles.WriteFile([ts,real.(results_all[:,i_eop].*(1.0/itraj))]," ",name_files_intermidiate[i_eop])
+                end
+            end
         end
     end
     tempwf = nothing
@@ -399,6 +428,7 @@ function mesolve(H0,H0_td,fs_H0_td,c_ops_no_td,c_ops_td,fs_c_ops_td,psi0,ts,e_op
     # ts is an array of times for the propagation
     # e_ops is a list of operators to perform expectation values
     println("-"^100); println("Starting a time-dependent MESOLVE Lindblad equation")
+    ttt = time()
     results = zeros(ComplexF64,length(ts),length(e_ops))
     results_all = results.*0.0
     temp = psi0 .* 0.0
@@ -415,7 +445,12 @@ function mesolve(H0,H0_td,fs_H0_td,c_ops_no_td,c_ops_td,fs_c_ops_td,psi0,ts,e_op
     
     function get_callback(ts,results,e_ops,temp)
         function savefunc(u,t,integrator)
+            
             it=findall(ts.≈t)[1]
+            if verbose
+                println("Progress it : ",it," out of ",length(ts), " : ",it*100.0/length(ts) , "%, time since start: " , time()-ttt)
+                flush(stdout)
+            end
             for i_eop in 1:length(e_ops)
                 mul!(temp,e_ops[i_eop],u)
                 results[it,i_eop] = tr(temp)
@@ -464,3 +499,4 @@ function dissipator_old!(result::Array , operator , rho , temp , temp2)
     return result
 end
 =#
+
